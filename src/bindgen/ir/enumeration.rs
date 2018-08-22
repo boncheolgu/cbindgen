@@ -10,8 +10,8 @@ use bindgen::config::{Config, Language};
 use bindgen::declarationtyperesolver::DeclarationTypeResolver;
 use bindgen::dependencies::Dependencies;
 use bindgen::ir::{
-    AnnotationSet, Cfg, CfgWrite, Documentation, GenericParams, GenericPath, Item, ItemContainer,
-    Repr, ReprStyle, ReprType, Struct, Type,
+    AnnotationSet, Cfg, ConditionWrite, Documentation, GenericParams, GenericPath, Item,
+    ItemContainer, Repr, ReprStyle, ReprType, Struct, ToCondition, Type,
 };
 use bindgen::library::Library;
 use bindgen::rename::{IdentifierType, RenameRule};
@@ -156,6 +156,19 @@ pub struct Enum {
 }
 
 impl Enum {
+    fn can_derive_eq(&self) -> bool {
+        if self.tag.is_none() {
+            return false;
+        }
+
+        self.variants.iter().all(|variant| {
+            variant
+                .body
+                .as_ref()
+                .map_or(true, |&(_, ref body)| body.can_derive_eq())
+        })
+    }
+
     pub fn load(item: &syn::ItemEnum, mod_cfg: &Option<Cfg>) -> Result<Enum, String> {
         let repr = Repr::load(&item.attrs)?;
         if repr == Repr::RUST {
@@ -293,8 +306,7 @@ impl Item for Enum {
                         )
                     }),
                     documentation: variant.documentation.clone(),
-                })
-                .collect();
+                }).collect();
         }
     }
 
@@ -318,7 +330,9 @@ impl Source for Enum {
             ReprType::I8 => "int8_t",
         });
 
-        self.cfg.write_before(config, out);
+        let condition = (&self.cfg).to_condition(config);
+
+        condition.write_before(config, out);
 
         self.documentation.write(config, out);
 
@@ -460,6 +474,8 @@ impl Source for Enum {
                 out.close_brace(true);
             }
 
+            let skip_fields = if separate_tag { 0 } else { 1 };
+
             // Emit convenience methods
             if config.language == Language::Cxx
                 && config.enumeration.derive_helper_methods(&self.annotations)
@@ -479,8 +495,6 @@ impl Source for Enum {
 
                     write!(out, "static {} {}(", self.name, variant.name);
 
-                    let skip_fields = if separate_tag { 0 } else { 1 };
-
                     if let Some((_, ref body)) = variant.body {
                         out.write_vertical_source_list(
                             &body
@@ -490,8 +504,7 @@ impl Source for Enum {
                                 .map(|&(ref name, ref ty, _)| {
                                     // const-ref args to constructor
                                     (format!("const& {}", arg_renamer(name)), ty.clone())
-                                })
-                                .collect(),
+                                }).collect(),
                             ListType::Join(","),
                         );
                     }
@@ -533,6 +546,55 @@ impl Source for Enum {
                 }
             }
 
+            if config.language == Language::Cxx
+                && self.can_derive_eq()
+                && config.structure.derive_eq(&self.annotations)
+            {
+                let other = if let Some(r) = config.function.rename_args {
+                    r.apply_to_snake_case("other", IdentifierType::FunctionArg)
+                } else {
+                    String::from("other")
+                };
+
+                out.new_line();
+                out.new_line();
+                write!(out, "bool operator==(const {}& {}) const", self.name, other);
+                out.open_brace();
+                write!(out, "if (tag != {}.tag)", other);
+                out.open_brace();
+                write!(out, "return false;");
+                out.close_brace(false);
+                out.new_line();
+                write!(out, "switch (tag)");
+                out.open_brace();
+                for variant in &self.variants {
+                    if let Some((ref variant_name, _)) = variant.body {
+                        write!(
+                            out,
+                            "case {}::{}: return {} == {}.{};",
+                            self.tag.as_ref().unwrap(),
+                            variant.name,
+                            variant_name,
+                            other,
+                            variant_name
+                        );
+                        out.new_line();
+                    }
+                }
+                write!(out, "default: return true;");
+                out.close_brace(false);
+                out.close_brace(false);
+
+                if config.structure.derive_neq(&self.annotations) {
+                    out.new_line();
+                    out.new_line();
+                    write!(out, "bool operator!=(const {}& {}) const", self.name, other);
+                    out.open_brace();
+                    write!(out, "return !(*this == {});", other);
+                    out.close_brace(false);
+                }
+            }
+
             if config.language == Language::C {
                 if config.style.generate_typedef() {
                     out.close_brace(false);
@@ -545,6 +607,6 @@ impl Source for Enum {
             }
         }
 
-        self.cfg.write_after(config, out);
+        condition.write_after(config, out);
     }
 }

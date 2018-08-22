@@ -4,11 +4,15 @@
 
 use std::collections::HashMap;
 use std::default::Default;
+use std::fmt;
 use std::fs::File;
 use std::io::prelude::*;
 use std::io::{self, BufReader};
 use std::path::Path;
 use std::str::FromStr;
+
+use serde::de::value::{MapAccessDeserializer, SeqAccessDeserializer};
+use serde::de::{Deserialize, Deserializer, MapAccess, SeqAccess, Visitor};
 
 use toml;
 
@@ -139,6 +143,40 @@ impl FromStr for Style {
 
 deserialize_enum_str!(Style);
 
+/// Different item types that we can generate and filter.
+#[derive(Debug, Clone, PartialEq)]
+pub enum ItemType {
+    Constants,
+    Globals,
+    Enums,
+    Structs,
+    Unions,
+    Typedefs,
+    OpaqueItems,
+    Functions,
+}
+
+impl FromStr for ItemType {
+    type Err = String;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        use self::ItemType::*;
+        Ok(match &*s.to_lowercase() {
+            "constants" => Constants,
+            "globals" => Globals,
+            "enums" => Enums,
+            "structs" => Structs,
+            "unions" => Unions,
+            "typedefs" => Typedefs,
+            "opaque" => OpaqueItems,
+            "functions" => Functions,
+            _ => return Err(format!("Unrecognized Style: '{}'.", s)),
+        })
+    }
+}
+
+deserialize_enum_str!(ItemType);
+
 /// Settings to apply when exporting items.
 #[derive(Debug, Clone, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -154,6 +192,8 @@ pub struct ExportConfig {
     pub rename: HashMap<String, String>,
     /// A prefix to add before the name of every item
     pub prefix: Option<String>,
+    /// Types of items to generate.
+    pub item_types: Vec<ItemType>,
 }
 
 impl Default for ExportConfig {
@@ -163,11 +203,16 @@ impl Default for ExportConfig {
             exclude: Vec::new(),
             rename: HashMap::new(),
             prefix: None,
+            item_types: Vec::new(),
         }
     }
 }
 
 impl ExportConfig {
+    pub(crate) fn should_generate(&self, item_type: ItemType) -> bool {
+        self.item_types.is_empty() || self.item_types.contains(&item_type)
+    }
+
     pub(crate) fn rename(&self, item_name: &mut String) {
         if let Some(name) = self.rename.get(item_name) {
             *item_name = name.clone();
@@ -368,6 +413,72 @@ impl Default for ConstantConfig {
     }
 }
 
+/// Settings to apply when running `rustc --pretty=expanded`
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "snake_case")]
+#[serde(deny_unknown_fields)]
+#[serde(default)]
+pub struct ParseExpandConfig {
+    /// The names of crates to parse with `rustc --pretty=expanded`
+    pub crates: Vec<String>,
+    /// Whether to enable all the features when expanding.
+    pub all_features: bool,
+    /// Whether to use the default feature set when expanding.
+    pub default_features: bool,
+    /// List of features to use when expanding. Combines with `default_features` like in
+    /// `Cargo.toml`.
+    pub features: Option<Vec<String>>,
+}
+
+impl Default for ParseExpandConfig {
+    fn default() -> ParseExpandConfig {
+        ParseExpandConfig {
+            crates: Vec::new(),
+            all_features: false,
+            default_features: true,
+            features: None,
+        }
+    }
+}
+
+// Backwards-compatibility deserializer for ParseExpandConfig. This allows accepting both the
+// simple `expand = ["crate"]` and the more complex `expand = {"crates": ["crate"],
+// "default_features": false}` format for the `expand` key.
+//
+// Note that one (major) difference between the two forms is that, for backwards-compatibility
+// reasons, the `expand = ["crate"]` form will enable the `--all-features` flag by default while
+// the `expand = {"crates": ["crate"]}` form will use the default feature set by default.
+fn retrocomp_parse_expand_config_deserialize<'de, D: Deserializer<'de>>(
+    deserializer: D,
+) -> Result<ParseExpandConfig, D::Error> {
+    struct ParseExpandVisitor;
+
+    impl<'de> Visitor<'de> for ParseExpandVisitor {
+        type Value = ParseExpandConfig;
+
+        fn expecting(&self, formatter: &mut fmt::Formatter) -> fmt::Result {
+            formatter.write_str("a map or sequence of string")
+        }
+
+        fn visit_seq<A: SeqAccess<'de>>(self, seq: A) -> Result<Self::Value, A::Error> {
+            let crates =
+                <Vec<String> as Deserialize>::deserialize(SeqAccessDeserializer::new(seq))?;
+            Ok(ParseExpandConfig {
+                crates,
+                all_features: true,
+                default_features: true,
+                features: None,
+            })
+        }
+
+        fn visit_map<A: MapAccess<'de>>(self, map: A) -> Result<Self::Value, A::Error> {
+            <ParseExpandConfig as Deserialize>::deserialize(MapAccessDeserializer::new(map))
+        }
+    }
+
+    deserializer.deserialize_any(ParseExpandVisitor)
+}
+
 /// Settings to apply when parsing.
 #[derive(Debug, Clone, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -387,8 +498,9 @@ pub struct ParseConfig {
     pub include: Option<Vec<String>>,
     /// The names of crates to not parse
     pub exclude: Vec<String>,
-    /// The names of crates to parse with `rustc --pretty=expanded`
-    pub expand: Vec<String>,
+    /// The configuration options for `rustc --pretty=expanded`
+    #[serde(deserialize_with = "retrocomp_parse_expand_config_deserialize")]
+    pub expand: ParseExpandConfig,
     /// Whether to use a new temporary target directory when running `rustc --pretty=expanded`.
     /// This may be required for some build processes.
     pub clean: bool,
@@ -400,7 +512,7 @@ impl Default for ParseConfig {
             parse_deps: false,
             include: None,
             exclude: Vec::new(),
-            expand: Vec::new(),
+            expand: ParseExpandConfig::default(),
             clean: false,
         }
     }

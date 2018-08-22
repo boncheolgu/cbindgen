@@ -10,7 +10,8 @@ use bindgen::config::{Config, Language};
 use bindgen::declarationtyperesolver::DeclarationTypeResolver;
 use bindgen::dependencies::Dependencies;
 use bindgen::ir::{
-    AnnotationSet, Cfg, CfgWrite, Documentation, GenericParams, Item, ItemContainer, Repr, Type,
+    AnnotationSet, Cfg, ConditionWrite, Documentation, GenericParams, Item, ItemContainer, Repr,
+    ToCondition, Type,
 };
 use bindgen::library::Library;
 use bindgen::mangle;
@@ -32,6 +33,11 @@ pub struct Struct {
 }
 
 impl Struct {
+    /// Whether this struct can derive operator== / operator!=.
+    pub fn can_derive_eq(&self) -> bool {
+        !self.fields.is_empty() && self.fields.iter().all(|x| x.1.can_cmp_eq())
+    }
+
     pub fn load(item: &syn::ItemStruct, mod_cfg: &Option<Cfg>) -> Result<Struct, String> {
         if Repr::load(&item.attrs)? != Repr::C {
             return Err("Struct is not marked #[repr(C)].".to_owned());
@@ -40,7 +46,10 @@ impl Struct {
         let (fields, tuple_struct) = match &item.fields {
             &syn::Fields::Unit => (Vec::new(), false),
             &syn::Fields::Named(ref fields) => {
-                let out = fields.named.iter().try_skip_map(|x| x.as_ident_and_type())?;
+                let out = fields
+                    .named
+                    .iter()
+                    .try_skip_map(|x| x.as_ident_and_type())?;
                 (out, false)
             }
             &syn::Fields::Unnamed(ref fields) => {
@@ -231,7 +240,8 @@ impl Item for Struct {
 
 impl Source for Struct {
     fn write<F: Write>(&self, config: &Config, out: &mut SourceWriter<F>) {
-        self.cfg.write_before(config, out);
+        let condition = (&self.cfg).to_condition(config);
+        condition.write_before(config, out);
 
         self.documentation.write(config, out);
 
@@ -296,8 +306,7 @@ impl Source for Struct {
                         .map(|&(ref name, ref ty, _)| {
                             // const-ref args to constructor
                             (format!("const& {}", arg_renamer(name)), ty.clone())
-                        })
-                        .collect(),
+                        }).collect(),
                     ListType::Join(","),
                 );
                 write!(out, ")");
@@ -322,6 +331,8 @@ impl Source for Struct {
                 String::from("other")
             };
 
+            let skip_fields = if self.is_tagged { 1 } else { 0 };
+
             let mut emit_op = |op, conjuc| {
                 if !wrote_start_newline {
                     wrote_start_newline = true;
@@ -341,6 +352,7 @@ impl Source for Struct {
                     &self
                         .fields
                         .iter()
+                        .skip(skip_fields)
                         .map(|x| format!("{} {} {}.{}", x.0, op, other, x.0))
                         .collect(),
                     ListType::Join(&format!(" {}", conjuc)),
@@ -349,16 +361,10 @@ impl Source for Struct {
                 out.close_brace(false);
             };
 
-            if config.structure.derive_eq(&self.annotations)
-                && !self.fields.is_empty()
-                && self.fields.iter().all(|x| x.1.can_cmp_eq())
-            {
+            if config.structure.derive_eq(&self.annotations) && self.can_derive_eq() {
                 emit_op("==", "&&");
             }
-            if config.structure.derive_neq(&self.annotations)
-                && !self.fields.is_empty()
-                && self.fields.iter().all(|x| x.1.can_cmp_eq())
-            {
+            if config.structure.derive_neq(&self.annotations) && self.can_derive_eq() {
                 emit_op("!=", "||");
             }
             if config.structure.derive_lt(&self.annotations)
@@ -394,7 +400,7 @@ impl Source for Struct {
             out.close_brace(true);
         }
 
-        self.cfg.write_after(config, out);
+        condition.write_after(config, out);
     }
 }
 

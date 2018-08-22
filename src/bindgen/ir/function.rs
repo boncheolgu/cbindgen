@@ -10,7 +10,9 @@ use bindgen::cdecl;
 use bindgen::config::{Config, Language, Layout};
 use bindgen::declarationtyperesolver::DeclarationTypeResolver;
 use bindgen::dependencies::Dependencies;
-use bindgen::ir::{AnnotationSet, Cfg, CfgWrite, Documentation, PrimitiveType, Type};
+use bindgen::ir::{
+    AnnotationSet, Cfg, ConditionWrite, Documentation, PrimitiveType, ToCondition, Type,
+};
 use bindgen::library::Library;
 use bindgen::monomorph::Monomorphs;
 use bindgen::rename::{IdentifierType, RenameRule};
@@ -114,8 +116,7 @@ impl Function {
                         r.apply_to_snake_case(&x.0, IdentifierType::FunctionArg),
                         x.1.clone(),
                     )
-                })
-                .collect()
+                }).collect()
         }
     }
 }
@@ -127,7 +128,8 @@ impl Source for Function {
             let prefix = config.function.prefix(&func.annotations);
             let postfix = config.function.postfix(&func.annotations);
 
-            func.cfg.write_before(config, out);
+            let condition = (&func.cfg).to_condition(config);
+            condition.write_before(config, out);
 
             func.documentation.write(config, out);
 
@@ -148,7 +150,7 @@ impl Source for Function {
             }
             out.write(";");
 
-            func.cfg.write_after(config, out);
+            condition.write_after(config, out);
         }
 
         fn write_2<W: Write>(func: &Function, config: &Config, out: &mut SourceWriter<W>) {
@@ -156,7 +158,9 @@ impl Source for Function {
             let prefix = config.function.prefix(&func.annotations);
             let postfix = config.function.postfix(&func.annotations);
 
-            func.cfg.write_before(config, out);
+            let condition = (&func.cfg).to_condition(config);
+
+            condition.write_before(config, out);
 
             func.documentation.write(config, out);
 
@@ -177,7 +181,7 @@ impl Source for Function {
             }
             out.write(";");
 
-            func.cfg.write_after(config, out);
+            condition.write_after(config, out);
         };
 
         let option_1 = out.measure(|out| write_1(self, config, out));
